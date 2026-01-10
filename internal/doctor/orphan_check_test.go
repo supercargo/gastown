@@ -3,8 +3,19 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+// mockSessionLister allows deterministic testing of orphan session detection.
+type mockSessionLister struct {
+	sessions []string
+	err      error
+}
+
+func (m *mockSessionLister) ListSessions() ([]string, error) {
+	return m.sessions, m.err
+}
 
 func TestNewOrphanSessionCheck(t *testing.T) {
 	check := NewOrphanSessionCheck()
@@ -339,5 +350,59 @@ func TestIsCrewSession_ComprehensivePatterns(t *testing.T) {
 				t.Errorf("isCrewSession(%q) = %v, want %v: %s", tt.session, got, tt.want, tt.reason)
 			}
 		})
+	}
+}
+
+// TestOrphanSessionCheck_Run_Deterministic tests the full Run path with a mock session
+// lister, ensuring deterministic behavior without depending on real tmux state.
+func TestOrphanSessionCheck_Run_Deterministic(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+		t.Fatalf("create mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("create rigs.json: %v", err)
+	}
+
+	// Create rig directories to make them "valid"
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "polecats"), 0o755); err != nil {
+		t.Fatalf("create gastown rig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "beads", "crew"), 0o755); err != nil {
+		t.Fatalf("create beads rig: %v", err)
+	}
+
+	lister := &mockSessionLister{
+		sessions: []string{
+			"gt-gastown-witness",      // valid: gastown rig exists
+			"gt-gastown-polecat1",     // valid: gastown rig exists
+			"gt-beads-refinery",       // valid: beads rig exists
+			"gt-unknown-witness",      // orphan: unknown rig doesn't exist
+			"gt-missing-crew-joe",     // orphan: missing rig doesn't exist
+			"random-session",          // ignored: doesn't match gt-* pattern
+		},
+	}
+	check := NewOrphanSessionCheckWithSessionLister(lister)
+	result := check.Run(&CheckContext{TownRoot: townRoot})
+
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning, got %v: %s", result.Status, result.Message)
+	}
+	if result.Message != "Found 2 orphaned session(s)" {
+		t.Fatalf("unexpected message: %q", result.Message)
+	}
+	if result.FixHint == "" {
+		t.Fatal("expected FixHint to be set for orphan sessions")
+	}
+
+	expectedOrphans := []string{"gt-unknown-witness", "gt-missing-crew-joe"}
+	if !reflect.DeepEqual(check.orphanSessions, expectedOrphans) {
+		t.Fatalf("cached orphans = %v, want %v", check.orphanSessions, expectedOrphans)
+	}
+
+	expectedDetails := []string{"Orphan: gt-unknown-witness", "Orphan: gt-missing-crew-joe"}
+	if !reflect.DeepEqual(result.Details, expectedDetails) {
+		t.Fatalf("details = %v, want %v", result.Details, expectedDetails)
 	}
 }
